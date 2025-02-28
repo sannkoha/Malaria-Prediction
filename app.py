@@ -35,7 +35,7 @@ def fetch_api_data():
 
 def preprocess_api_data(df_api):
     """
-    Converts the DHIS2Period to a Date column, fills missing District values,
+    Converts the DHIS2Period to a Date column, assigns default District names for missing values,
     and extracts MeasurementType and AgeGroup from DataElementName.
     """
     def parse_dhis2period(period_str):
@@ -47,8 +47,18 @@ def preprocess_api_data(df_api):
             return pd.NaT
 
     df_api['Date'] = df_api['DHIS2Period'].apply(parse_dhis2period)
-    # Fill missing District using FacilityName if necessary
-    df_api['District'] = df_api['District'].fillna(df_api['FacilityName'])
+    
+    # Ensure missing District values are empty strings
+    df_api['District'] = df_api['District'].fillna("").apply(lambda x: x.strip())
+    # Define default districts to use
+    default_districts = ['Bo', 'Kenema', 'Port Loko', 'Bombali', 'Kailahun']
+    # Assign a default district in a round-robin fashion for empty District entries
+    def assign_default_district(val, idx):
+        if val == "":
+            return default_districts[idx % len(default_districts)]
+        else:
+            return val
+    df_api['District'] = [assign_default_district(val, i) for i, val in enumerate(df_api['District'])]
     
     def parse_data_element(de_name):
         de_clean = de_name.replace("KD_Kush", "").strip()
@@ -73,7 +83,7 @@ def preprocess_api_data(df_api):
 def pivot_and_feature_engineer(df_api):
     """
     Pivots the raw data so each row corresponds to a District and Date,
-    creates lag features, rolling means, and adds time and district dummy features.
+    creates a single lag feature, and adds month, year, and district dummy features.
     """
     # Pivot data: each row is a District-Date pair; columns for each MeasurementType & AgeGroup
     df_pivot = df_api.pivot_table(
@@ -105,27 +115,23 @@ def pivot_and_feature_engineer(df_api):
     # Sort by District and Date
     df_pivot.sort_values(by=['District_', 'Date_'], inplace=True)
     
-    # Create lag features for temporal dependencies
+    # Create a single lag feature for temporal dependency
     df_pivot['Lag_1'] = df_pivot.groupby('District_')[target].shift(1)
-    df_pivot['Lag_2'] = df_pivot.groupby('District_')[target].shift(2)
-    df_pivot['Lag_3'] = df_pivot.groupby('District_')[target].shift(3)
-    
-    # Create rolling mean over the last 3 months
-    df_pivot['Rolling_Mean_3'] = df_pivot.groupby('District_')[target].transform(lambda x: x.rolling(3, min_periods=1).mean())
     
     # Add month and year features
     df_pivot['Month'] = df_pivot['Date_'].dt.month
     df_pivot['Year'] = df_pivot['Date_'].dt.year
     
-    # One-hot encode the district names using a prefix that matches training (note the underscore in the prefix)
+    # One-hot encode the district names using the same prefix as used during training.
+    # Using prefix "District_" ensures dummy columns like "District__Bo" (note the double underscore).
     district_dummies = pd.get_dummies(df_pivot['District_'], prefix='District_')
     df_model = pd.concat([df_pivot, district_dummies], axis=1)
     
-    # Drop rows with missing lag values (first few records per district)
-    df_model = df_model.dropna(subset=['Lag_1', 'Lag_2', 'Lag_3']).reset_index(drop=True)
+    # Drop rows with missing lag values (first record per district)
+    df_model = df_model.dropna(subset=['Lag_1']).reset_index(drop=True)
     
-    # Define the feature columns (order matters for prediction)
-    feature_cols = ['Lag_1', 'Lag_2', 'Lag_3', 'Rolling_Mean_3', 'Month', 'Year'] + list(district_dummies.columns)
+    # Define the feature columns in the correct order
+    feature_cols = ['Lag_1', 'Month', 'Year'] + list(district_dummies.columns)
     
     return df_model, feature_cols, target, list(district_dummies.columns)
 
@@ -134,7 +140,7 @@ def load_model():
     """
     Loads the pre-trained Random Forest model.
     """
-    model = joblib.load('best_rf_model_api_improved.pkl')
+    model = joblib.load('best_rf_model_api_ver.pkl')
     return model
 
 @st.cache_data
@@ -156,7 +162,7 @@ def get_processed_data():
 
 def forecast_future(model, df_model, feature_cols, target, dummy_cols, selected_district, forecast_months, current_override=None):
     """
-    For the selected district, this function generates future predictions by iteratively updating lag features.
+    For the selected district, this function generates future predictions by iteratively updating the single lag feature.
     """
     # Filter data for the selected district
     df_district = df_model[df_model['District_'] == selected_district].copy()
@@ -172,12 +178,8 @@ def forecast_future(model, df_model, feature_cols, target, dummy_cols, selected_
     else:
         last_target = df_district.iloc[-1][target]
     
-    # Get the last available lag values
-    last_row = df_district.iloc[-1]
-    prev_lag1 = last_target
-    prev_lag2 = last_row['Lag_1']
-    prev_lag3 = last_row['Lag_2']
-    
+    # Use only a single lag value
+    prev_lag = last_target
     future_predictions = []
     for i in range(1, forecast_months + 1):
         next_date = last_date + pd.DateOffset(months=i)
@@ -185,21 +187,15 @@ def forecast_future(model, df_model, feature_cols, target, dummy_cols, selected_
         year_val = next_date.year
         
         # Build dummy dictionary from dummy_cols.
-        # Find the dummy column that contains the selected district (e.g., "District__Aethel CHP")
+        # Since dummy columns were created with prefix "District_", they appear as "District__Bo", etc.
+        district_col = "District__" + selected_district  # note the double underscore
         district_dummy = {col: 0 for col in dummy_cols}
-        matching_cols = [col for col in dummy_cols if selected_district in col]
-        if matching_cols:
-            district_dummy[matching_cols[0]] = 1
-        
-        # Compute rolling mean using current lag values
-        rolling_mean = np.mean([prev_lag1, prev_lag2, prev_lag3])
+        if district_col in district_dummy:
+            district_dummy[district_col] = 1
         
         # Build a DataFrame for prediction with the correct feature order
         X_new = pd.DataFrame({
-            'Lag_1': [prev_lag1],
-            'Lag_2': [prev_lag2],
-            'Lag_3': [prev_lag3],
-            'Rolling_Mean_3': [rolling_mean],
+            'Lag_1': [prev_lag],
             'Month': [month_val],
             'Year': [year_val],
         })
@@ -215,10 +211,8 @@ def forecast_future(model, df_model, feature_cols, target, dummy_cols, selected_
             'Predicted': pred
         })
         
-        # Update lag values for the next iteration
-        prev_lag3 = prev_lag2
-        prev_lag2 = prev_lag1
-        prev_lag1 = pred
+        # Update lag for next iteration
+        prev_lag = pred
         
     df_future = pd.DataFrame(future_predictions)
     return df_future
@@ -314,7 +308,7 @@ if st.sidebar.button("Run Forecast"):
             
             # 6. Correlation Heatmap of Engineered Features
             st.subheader("Correlation Heatmap of Features")
-            corr_features = ['Lag_1', 'Lag_2', 'Lag_3', 'Rolling_Mean_3', 'Month', 'Year'] + dummy_cols
+            corr_features = ['Lag_1', 'Month', 'Year'] + dummy_cols
             corr = df_model[corr_features + [target]].corr()
             fig_corr = px.imshow(corr, text_auto=True,
                                  title="Correlation Heatmap of Engineered Features and Target")
