@@ -65,16 +65,20 @@ def parse_dhis2period(period_str):
 
 df_api['Date'] = df_api['DHIS2Period'].apply(parse_dhis2period)
 
-# Define a list of default districts (the ones that exist)
-default_districts = ['Bo', 'Kenema', 'Port Loko', 'Bombali', 'Kailahun']
-
-# If 'District' is missing, assign a default district from our list in a round-robin fashion
+# Instead of hardcoding the default districts, extract them from the API data
 df_api['District'] = df_api['District'].fillna("")  # ensure empty strings for missing values
+# Extract all non-empty district names from the API data
+extracted_districts = df_api['District'][df_api['District'].str.strip() != ""].unique()
+default_districts = sorted(extracted_districts)
+print("Extracted Districts:", default_districts)
+
+# If 'District' is missing, assign a default district from the extracted list in a round-robin fashion
 def assign_default_district(row, idx):
     if row['District'].strip() == "":
         return default_districts[idx % len(default_districts)]
     else:
         return row['District']
+
 df_api['District'] = [assign_default_district(row, i) for i, row in df_api.iterrows()]
 
 # Create a function to extract MeasurementType and AgeGroup from DataElementName.
@@ -240,58 +244,66 @@ print("Best RF RMSE:", rmse_test, "MAE:", mae_test)
 joblib.dump(best_rf_model, 'best_rf_model_api_ver.pkl')
 
 # -------------------------------
-# 7. Forecasting Future Malaria Trends using the Saved Model
+# 7. Forecasting Future Malaria Trends for Each District using the Saved Model
 # -------------------------------
 model_rf = joblib.load('best_rf_model_api_ver.pkl')
 
-last_date = df_model['Date_'].max()
-last_target = df_model.sort_values('Date_').tail(1)[target].values[0]
-district = df_model.sort_values('Date_').tail(1)['District_'].values[0]
-
+unique_districts = df_model['District_'].unique()
 future_months = 6
-future_predictions = []
+all_future_predictions = []
 
-# For forecasting, use only the previous month's value (Lag_1)
-prev_lag = last_target
+for district in unique_districts:
+    # Filter data for the current district and sort by Date
+    df_district = df_model[df_model['District_'] == district].sort_values('Date_')
+    if df_district.empty:
+        continue
+    last_date = df_district['Date_'].max()
+    last_target = df_district.iloc[-1][target]
+    
+    # Initialize lag with the last known target value for this district
+    prev_lag = last_target
+    
+    for i in range(1, future_months + 1):
+        next_date = last_date + pd.DateOffset(months=i)
+        month_val = next_date.month
+        year_val = next_date.year
+        
+        # One-hot encode the current district for prediction
+        district_dummy = {col: 0 for col in district_dummies.columns}
+        district_col = "District_" + district
+        if district_col in district_dummy:
+            district_dummy[district_col] = 1
+        
+        # Build feature vector with Lag_1, Month, Year, and district dummies.
+        X_new = pd.DataFrame({
+            'Lag_1': [prev_lag],
+            'Month': [month_val],
+            'Year': [year_val],
+        })
+        for col, val in district_dummy.items():
+            X_new[col] = val
+        
+        # Ensure the feature order is the same as in training
+        X_new = X_new[features]
+        
+        pred = model_rf.predict(X_new)[0]
+        
+        all_future_predictions.append({
+            'District': district,
+            'Date': next_date,
+            'Predicted': pred
+        })
+        
+        # Update lag for next iteration
+        prev_lag = pred
 
-for i in range(1, future_months + 1):
-    next_date = last_date + pd.DateOffset(months=i)
-    month_val = next_date.month
-    year_val = next_date.year
-    
-    # One-hot encode the current district for prediction
-    district_dummy = {col: 0 for col in district_dummies.columns}
-    district_col = "District_" + district
-    if district_col in district_dummy:
-        district_dummy[district_col] = 1
-
-    # Build feature vector with only Lag_1, Month, Year and district dummies.
-    X_new = pd.DataFrame({
-        'Lag_1': [prev_lag],
-        'Month': [month_val],
-        'Year': [year_val],
-    })
-    for col, val in district_dummy.items():
-        X_new[col] = val
-    
-    pred = model_rf.predict(X_new)[0]
-    
-    future_predictions.append({
-        'District': district,
-        'Date': next_date,
-        'Predicted': pred
-    })
-    
-    # Update lag for next iteration:
-    prev_lag = pred
-
-df_future = pd.DataFrame(future_predictions)
+df_future = pd.DataFrame(all_future_predictions)
 print("Future Predictions:")
 print(df_future)
 
-plt.figure(figsize=(10, 6))
-plt.plot(df_future['Date'], df_future['Predicted'], marker='o', linestyle='-')
-plt.title('Forecast of Future Malaria Predictions')
+plt.figure(figsize=(12, 8))
+sns.lineplot(data=df_future, x='Date', y='Predicted', hue='District', marker='o')
+plt.title('Forecast of Future Malaria Predictions by District')
 plt.xlabel('Date')
 plt.ylabel('Predicted Victims Count')
 plt.xticks(rotation=45)
