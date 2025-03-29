@@ -2,22 +2,28 @@ import numpy as np
 import pandas as pd
 import requests
 import re
-from datetime import datetime
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.ensemble import RandomForestRegressor 
+from datetime import datetime
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.model_selection import GridSearchCV
+from sklearn.linear_model import LinearRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import PolynomialFeatures
 import joblib
+import math
+#Holt’s linear model:
+# from statsmodels.tsa.holtwinters import Holt
 
 # -------------------------------
 # 1. API Data Fetching and Loading
 # -------------------------------
-url = "http://hubapi.duchimatech.com/External/pullMLData"
+url = "https://slhubmlapi.npha.gov.sl/External/pullMLData"
 payload = {
-    "_token": "F1A7D842-36B5-4C8C-A2B5-6F9D19D2B073",
-    "StartDate": "2023-01-01",  # expanded start date
-    "EndDate": "2025-02-28"
+    "_token": "620FF4EB-829F-4179-85F3-179524065C4E",
+    "StartDate": "2025-01-14",  # expanded start date
+    "EndDate": "2025-03-28"
 }
 
 response = requests.post(url, json=payload)
@@ -27,23 +33,23 @@ if api_response.get('status') != 200:
     raise Exception("API Error: Status code is not 200.")
 
 # Create DataFrame from API data
-df_api = pd.DataFrame(api_response.get('data'))
-print("API Data Shape:", df_api.shape)
-print(df_api.head())
+df = pd.DataFrame(api_response.get('data'))
+print("API Data Shape:", df.shape)
+print(df.head())
 
 # -------------------------------
-# 1A. Additional Visualizations on Raw API Data
+# 2. Exploratory Data Analysis (EDA)
 # -------------------------------
 plt.figure(figsize=(10,6))
-sns.histplot(df_api['DHIS2AggregateValue'], bins=20, kde=True)
-plt.title("Distribution of DHIS2AggregateValue (Raw API Data)")
+sns.histplot(df['DHIS2AggregateValue'], bins=20, kde=True)
+plt.title("Distribution of DHIS2AggregateValue")
 plt.xlabel("Aggregate Value")
 plt.ylabel("Frequency")
 plt.tight_layout()
 plt.show()
 
 plt.figure(figsize=(12,6))
-sns.countplot(data=df_api, x='District', order=df_api['District'].value_counts().index)
+sns.countplot(data=df, x='District', order=df['District'].value_counts().index)
 plt.title("Count of Records by District")
 plt.xlabel("District")
 plt.ylabel("Count")
@@ -51,261 +57,271 @@ plt.xticks(rotation=45)
 plt.tight_layout()
 plt.show()
 
+plt.figure(figsize=(10,6))
+sns.countplot(data=df, x='TargetedDisease', order=df['TargetedDisease'].value_counts().index)
+plt.title("Count of Records by Disease")
+plt.xlabel("Disease")
+plt.ylabel("Count")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+print("Unique Diseases:", df['TargetedDisease'].unique())
+
 # -------------------------------
-# 2. Data Preprocessing and Cleaning
+# 3. Data Preprocessing and Cleaning
 # -------------------------------
-# Convert DHIS2Period (e.g., "202412") into a proper Date column (set to first day of month)
 def parse_dhis2period(period_str):
     try:
-        year = int(period_str[:4])
-        month = int(period_str[4:])
-        return pd.Timestamp(year=year, month=month, day=1)
+        if "W" in period_str:
+            year = int(period_str[:4])
+            week = int(period_str.split("W")[1])
+            return pd.to_datetime(f'{year}-01-01') + pd.Timedelta(days=(week-1)*7)
+        else:
+            year = int(period_str[:4])
+            month = int(period_str[4:])
+            return pd.Timestamp(year=year, month=month, day=1)
     except Exception as e:
         return pd.NaT
 
-df_api['Date'] = df_api['DHIS2Period'].apply(parse_dhis2period)
-
-# Instead of hardcoding the default districts, extract them from the API data
-df_api['District'] = df_api['District'].fillna("")  # ensure empty strings for missing values
-# Extract all non-empty district names from the API data
-extracted_districts = df_api['District'][df_api['District'].str.strip() != ""].unique()
-default_districts = sorted(extracted_districts)
-print("Extracted Districts:", default_districts)
-
-# If 'District' is missing, assign a default district from the extracted list in a round-robin fashion
-def assign_default_district(row, idx):
-    if row['District'].strip() == "":
-        return default_districts[idx % len(default_districts)]
-    else:
-        return row['District']
-
-df_api['District'] = [assign_default_district(row, i) for i, row in df_api.iterrows()]
-
-# Create a function to extract MeasurementType and AgeGroup from DataElementName.
-def parse_data_element(de_name):
-    de_clean = de_name.replace("KD_Kush", "").strip()
-    m = re.search(r'(.+?)\s*([<>]\d+)', de_clean)
-    if m:
-        measurement_type = m.group(1).strip()
-        age_indicator = m.group(2)
-        if age_indicator == '<5':
-            age_group = 'lt5'
-        elif age_indicator == '>5':
-            age_group = 'gt5'
-        else:
-            age_group = 'unknown'
-    else:
-        measurement_type = de_clean
-        age_group = 'unknown'
-    return pd.Series([measurement_type, age_group])
-
-df_api[['MeasurementType', 'AgeGroup']] = df_api['DataElementName'].apply(parse_data_element)
-print(df_api[['DataElementName', 'MeasurementType', 'AgeGroup', 'Date']].head())
+df['Date'] = df['DHIS2Period'].apply(parse_dhis2period)
+df['District'] = df['District'].fillna("Unknown District")
 
 # -------------------------------
-# 3. Reshape Data for Analysis
+# 4. Additional Visualizations (Post Preprocessing)
 # -------------------------------
-# Pivot the data so each row is identified by District and Date,
-# with columns for each combination of MeasurementType and AgeGroup.
-df_pivot = df_api.pivot_table(
-    index=['District', 'Date'],
-    columns=['MeasurementType', 'AgeGroup'],
-    values='DHIS2AggregateValue',
-    aggfunc='sum',
-    fill_value=0
-).reset_index()
-
-# Flatten the MultiIndex columns
-df_pivot.columns = ['_'.join(col).strip() if isinstance(col, tuple) else col for col in df_pivot.columns.values]
-print("Pivoted DataFrame Head:")
-print(df_pivot.head())
-
-# -------------------------------
-# 4. Visualization: Trends and Comparisons (Post Preprocessing)
-# -------------------------------
-trend_df = df_api.groupby('Date')['DHIS2AggregateValue'].sum().reset_index()
-plt.figure(figsize=(12, 6))
-plt.plot(trend_df['Date'], trend_df['DHIS2AggregateValue'], marker='o')
-plt.title('Monthly Malaria Aggregate Values Trend (API Data)')
-plt.xlabel('Date')
-plt.ylabel('Aggregate Value')
+overall_trend = df.groupby('Date')['DHIS2AggregateValue'].sum().reset_index()
+plt.figure(figsize=(12,6))
+plt.plot(overall_trend['Date'], overall_trend['DHIS2AggregateValue'], marker='o')
+plt.title("Overall Time Trend of DHIS2AggregateValue")
+plt.xlabel("Date")
+plt.ylabel("Total Aggregate Value")
 plt.xticks(rotation=45)
 plt.tight_layout()
 plt.show()
 
-# District-wise Comparison
-agg_district = df_api.groupby('District')['DHIS2AggregateValue'].sum().reset_index()
-plt.figure(figsize=(14, 7))
+disease_trend = df.groupby(['District', 'TargetedDisease', 'Date'])['DHIS2AggregateValue'].sum().reset_index()
+plt.figure(figsize=(14,8))
+sns.lineplot(data=disease_trend, x='Date', y='DHIS2AggregateValue', hue='TargetedDisease', style='District', markers=True)
+plt.title("Disease Trends per District Over Time")
+plt.xlabel("Date")
+plt.ylabel("Aggregate Value")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+agg_district = df.groupby('District')['DHIS2AggregateValue'].sum().reset_index()
+plt.figure(figsize=(14,7))
 sns.barplot(x='District', y='DHIS2AggregateValue', data=agg_district, palette='viridis')
-plt.title('Total Aggregate Values by District')
-plt.xlabel('District')
-plt.ylabel('Aggregate Value')
+plt.title("Total Aggregate Value by District")
+plt.xlabel("District")
+plt.ylabel("Aggregate Value")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+agg_disease = df.groupby('TargetedDisease')['DHIS2AggregateValue'].sum().reset_index().sort_values(by='DHIS2AggregateValue', ascending=False)
+plt.figure(figsize=(10,6))
+sns.barplot(x='TargetedDisease', y='DHIS2AggregateValue', data=agg_disease, palette='rocket')
+plt.title("Dominating Disease by Total Aggregate Value")
+plt.xlabel("Disease")
+plt.ylabel("Total Aggregate Value")
 plt.xticks(rotation=45)
 plt.tight_layout()
 plt.show()
 
 # -------------------------------
-# 5. Feature Engineering for Modeling
+# 5. Data Aggregation and Feature Engineering for Forecasting
 # -------------------------------
-# Choose a target variable.
-if 'Victims_gt5' in df_pivot.columns and 'Victims_lt5' in df_pivot.columns:
-    df_pivot['Total_Victims'] = df_pivot['Victims_lt5'] + df_pivot['Victims_gt5']
-    target = 'Total_Victims'
-elif any(col.startswith('Victims') for col in df_pivot.columns):
-    target = [col for col in df_pivot.columns if col.startswith('Victims')][0]
-else:
-    target = 'DHIS2AggregateValue'  # fallback
+df_agg = df.groupby(['TargetedDisease', 'District', 'Date'])['DHIS2AggregateValue'].sum().reset_index()
+df_agg['Month'] = df_agg['Date'].dt.month
+df_agg['Year'] = df_agg['Date'].dt.year
+df_agg['DateOrdinal'] = df_agg['Date'].apply(lambda x: x.toordinal())
 
-# Sort by District and Date
-df_pivot.sort_values(by=['District_', 'Date_'], inplace=True)
+# Create a time_index (months elapsed since first date)
+start_date = df_agg['Date'].min()
+df_agg['time_index'] = df_agg['Date'].apply(lambda x: (x.year - start_date.year) * 12 + (x.month - start_date.month))
 
-# Create only one lag feature to capture temporal dependency
-df_pivot['Lag_1'] = df_pivot.groupby('District_')[target].shift(1)
+# Add cyclical features for month
+df_agg['MonthSin'] = df_agg['Month'].apply(lambda x: math.sin(2 * math.pi * x / 12))
+df_agg['MonthCos'] = df_agg['Month'].apply(lambda x: math.cos(2 * math.pi * x / 12))
 
-# Add time features (month and year)
-df_pivot['Month'] = df_pivot['Date_'].dt.month
-df_pivot['Year'] = df_pivot['Date_'].dt.year
-
-# One-hot encode the District so the model can learn district-specific trends.
-district_dummies = pd.get_dummies(df_pivot['District_'], prefix='District_')
-df_model = pd.concat([df_pivot, district_dummies], axis=1)
-
-# Drop rows with missing lag values (first observation per District)
-df_model = df_model.dropna(subset=['Lag_1']).reset_index(drop=True)
-print("Modeling Data Shape:", df_model.shape)
-print(df_model[['District_', 'Date_', target, 'Lag_1', 'Month', 'Year']].head())
-
-# Additional Visualization: Correlation heatmap of engineered features and target
-features = ['Lag_1', 'Month', 'Year'] + list(district_dummies.columns)
-plt.figure(figsize=(10,8))
-corr = df_model[features + [target]].corr()
-sns.heatmap(corr, annot=True, cmap='coolwarm')
-plt.title("Correlation Heatmap of Engineered Features and Target")
-plt.tight_layout()
-plt.show()
+# One-hot encode the District variable.
+df_model = pd.get_dummies(df_agg, columns=['District'], prefix='District')
+print("Model Data Shape:", df_model.shape)
+print(df_model.head())
 
 # -------------------------------
-# 6. Train-Test Split and Modeling
+# 6. Model Training per Disease (with Candidate Models)
 # -------------------------------
-X = df_model[features]
-y = df_model[target]
+disease_models = {}
+diseases = df_model['TargetedDisease'].unique()
+print("Unique Diseases for Modeling:", diseases)
 
-split_index = int(len(df_model) * 0.8)
-X_train = X.iloc[:split_index]
-y_train = y.iloc[:split_index]
-X_test = X.iloc[split_index:]
-y_test = y.iloc[split_index:]
-
-print("Training Features Shape:", X_train.shape)
-print("Training Target Shape:", y_train.shape)
-print("Testing Features Shape:", X_test.shape)
-print("Testing Target Shape:", y_test.shape)
-
-rf = RandomForestRegressor(n_estimators=100, random_state=42)
-rf.fit(X_train, y_train)
-
-y_pred_rf = rf.predict(X_test)
-rmse_rf = np.sqrt(mean_squared_error(y_test, y_pred_rf))
-mae_rf = mean_absolute_error(y_test, y_pred_rf)
-print("Random Forest RMSE:", rmse_rf)
-print("Random Forest MAE:", mae_rf)
-
-param_grid = {
-    'n_estimators': [100, 200, 300],
-    'max_depth': [None, 10, 20],
-    'min_samples_split': [2, 5, 10]
-}
-
-grid_search = GridSearchCV(
-    estimator=rf,
-    param_grid=param_grid,
-    cv=2,  
-    scoring='neg_mean_squared_error',
-    n_jobs=-1
-)
-grid_search.fit(X_train, y_train)
-
-best_params = grid_search.best_params_
-print("Best Parameters:", best_params)
-best_rf_model = grid_search.best_estimator_
-
-y_train_pred_best = best_rf_model.predict(X_train)
-y_test_pred_best = best_rf_model.predict(X_test)
-rmse_train = np.sqrt(mean_squared_error(y_train, y_train_pred_best))
-mae_train = mean_absolute_error(y_train, y_train_pred_best)
-rmse_test = np.sqrt(mean_squared_error(y_test, y_test_pred_best))
-mae_test = mean_absolute_error(y_test, y_test_pred_best)
-
-print("Training Set Evaluation:")
-print("Best RF RMSE:", rmse_train, "MAE:", mae_train)
-print("Testing Set Evaluation:")
-print("Best RF RMSE:", rmse_test, "MAE:", mae_test)
-
-joblib.dump(best_rf_model, 'best_rf_model_api_ver.pkl')
-
-# -------------------------------
-# 7. Forecasting Future Malaria Trends for Each District using the Saved Model
-# -------------------------------
-model_rf = joblib.load('best_rf_model_api_ver.pkl')
-
-unique_districts = df_model['District_'].unique()
-future_months = 6
-all_future_predictions = []
-
-for district in unique_districts:
-    # Filter data for the current district and sort by Date
-    df_district = df_model[df_model['District_'] == district].sort_values('Date_')
-    if df_district.empty:
-        continue
-    last_date = df_district['Date_'].max()
-    last_target = df_district.iloc[-1][target]
+for disease in diseases:
+    print(f"\nProcessing disease: {disease}")
+    df_disease = df_model[df_model['TargetedDisease'] == disease].copy()
+    df_disease.sort_values(by='Date', inplace=True)
     
-    # Initialize lag with the last known target value for this district
-    prev_lag = last_target
+    # Feature set: use time_index, DateOrdinal, cyclical features, and district dummies.
+    feature_cols = ['time_index', 'DateOrdinal', 'MonthSin', 'MonthCos'] + \
+                   [col for col in df_disease.columns if col.startswith("District_")]
+    target_col = 'DHIS2AggregateValue'
     
+    # Time-based split: first 80% for training, last 20% for testing.
+    split_index = int(len(df_disease) * 0.8)
+    X_train = df_disease[feature_cols].iloc[:split_index]
+    y_train = df_disease[target_col].iloc[:split_index]
+    X_test = df_disease[feature_cols].iloc[split_index:]
+    y_test = df_disease[target_col].iloc[split_index:]
+    
+    print("Training samples:", X_train.shape[0], "Testing samples:", X_test.shape[0])
+    
+    # Candidate Model 1: Random Forest
+    model_rf = RandomForestRegressor(n_estimators=100, random_state=42)
+    model_rf.fit(X_train, y_train)
+    pred_rf = model_rf.predict(X_test)
+    rmse_rf = np.sqrt(mean_squared_error(y_test, pred_rf))
+    
+    # Candidate Model 2: Gradient Boosting
+    model_gb = GradientBoostingRegressor(n_estimators=100, random_state=42)
+    model_gb.fit(X_train, y_train)
+    pred_gb = model_gb.predict(X_test)
+    rmse_gb = np.sqrt(mean_squared_error(y_test, pred_gb))
+    
+    # Candidate Model 3: Polynomial Regression (degree=2)
+    model_poly = make_pipeline(PolynomialFeatures(degree=2), LinearRegression())
+    model_poly.fit(X_train, y_train)
+    pred_poly = model_poly.predict(X_test)
+    rmse_poly = np.sqrt(mean_squared_error(y_test, pred_poly))
+    
+    print(f"RMSE for RandomForest: {rmse_rf:.2f}")
+    print(f"RMSE for GradientBoosting: {rmse_gb:.2f}")
+    print(f"RMSE for PolyRegression: {rmse_poly:.2f}")
+    
+    # Select the best model (lowest RMSE)
+    candidate_models = {
+        "RandomForest": (model_rf, rmse_rf),
+        "GradientBoosting": (model_gb, rmse_gb),
+        "PolyRegression": (model_poly, rmse_poly)
+    }
+    best_model_name = min(candidate_models, key=lambda k: candidate_models[k][1])
+    best_model = candidate_models[best_model_name][0]
+    best_rmse = candidate_models[best_model_name][1]
+    print(f"Selected model for {disease}: {best_model_name} (RMSE: {best_rmse:.2f})")
+    
+    # Calculate residual standard deviation on training set for noise injection.
+    residual_std = np.std(y_train - best_model.predict(X_train))
+    
+    # Save the best model and residual_std.
+    model_filename = f"best_model_{disease.lower().replace(' ', '_')}.pkl"
+    joblib.dump(best_model, model_filename)
+    
+    disease_models[disease] = {
+        "model": best_model,
+        "features": feature_cols,
+        "target": target_col,
+        "data": df_disease,
+        "residual_std": residual_std  # for noise injection in forecasting
+    }
+    
+    # Optionally, a Holt's linear trend model if data permits:
+    # if len(df_disease) >= 3:
+    #     series = df_disease.set_index('Date')[target_col]
+    #     holt_model = Holt(series).fit(optimized=True)
+    #     holt_rmse = np.sqrt(mean_squared_error(y_test, holt_model.fittedvalues[-len(y_test):]))
+    #     print(f"Holt's RMSE for {disease}: {holt_rmse:.2f}")
+
+# -------------------------------
+# 7. Forecasting Functions (with noise injection)
+# -------------------------------
+def forecast_disease(disease, district, future_months=6, noise_injection=True):
+    """
+    Forecast future aggregate values for a given disease and district over future_months.
+    If the district is not present in historical data, the district dummies remain 0.
+    Optionally, random noise (based on training residuals) is added to enhance forecast variety.
+    """
+    if disease not in disease_models:
+        raise Exception(f"No model found for disease: {disease}")
+    
+    model_info = disease_models[disease]
+    model = model_info["model"]
+    features = model_info["features"]
+    df_disease = model_info["data"]
+    residual_std = model_info["residual_std"]
+    
+    last_date = df_disease['Date'].max()
+    last_time_index = df_disease.iloc[-1]['time_index']
+    
+    forecasts = []
     for i in range(1, future_months + 1):
         next_date = last_date + pd.DateOffset(months=i)
-        month_val = next_date.month
-        year_val = next_date.year
+        time_index = last_time_index + i
+        date_ordinal = next_date.toordinal()
+        month = next_date.month
+        month_sin = math.sin(2 * math.pi * month / 12)
+        month_cos = math.cos(2 * math.pi * month / 12)
         
-        # One-hot encode the current district for prediction
-        district_dummy = {col: 0 for col in district_dummies.columns}
-        district_col = "District_" + district
-        if district_col in district_dummy:
-            district_dummy[district_col] = 1
+        record = {
+            'time_index': time_index,
+            'DateOrdinal': date_ordinal,
+            'MonthSin': month_sin,
+            'MonthCos': month_cos
+        }
+        # Set district one-hot dummies.
+        district_cols = [col for col in features if col.startswith("District_")]
+        for col in district_cols:
+            record[col] = 0
+        district_dummy = "District_" + district
+        if district_dummy in district_cols:
+            record[district_dummy] = 1
         
-        # Build feature vector with Lag_1, Month, Year, and district dummies.
-        X_new = pd.DataFrame({
-            'Lag_1': [prev_lag],
-            'Month': [month_val],
-            'Year': [year_val],
-        })
-        for col, val in district_dummy.items():
-            X_new[col] = val
+        X_new = pd.DataFrame([record])[features]
+        pred = model.predict(X_new)[0]
         
-        # Ensure the feature order is the same as in training
-        X_new = X_new[features]
+        # Inject random noise based on residual_std to increase variety.
+        if noise_injection:
+            noise = np.random.normal(scale=residual_std)
+            pred += noise
         
-        pred = model_rf.predict(X_new)[0]
-        
-        all_future_predictions.append({
+        forecasts.append({
+            'Disease': disease,
             'District': district,
             'Date': next_date,
-            'Predicted': pred
+            'PredictedAggregateValue': pred
         })
-        
-        # Update lag for next iteration
-        prev_lag = pred
+    
+    return pd.DataFrame(forecasts)
 
-df_future = pd.DataFrame(all_future_predictions)
-print("Future Predictions:")
-print(df_future)
+# -------------------------------
+# 8. Forecasting and Plotting
+# -------------------------------
+district_forecast = forecast_disease("Total Malaria Tested", "Bo District", future_months=6)
+print("District-level Forecast for Total Malaria Tested in Bo District:")
+print(district_forecast)
 
-plt.figure(figsize=(12, 8))
-sns.lineplot(data=df_future, x='Date', y='Predicted', hue='District', marker='o')
-plt.title('Forecast of Future Malaria Predictions by District')
-plt.xlabel('Date')
-plt.ylabel('Predicted Victims Count')
+plt.figure(figsize=(12,8))
+sns.lineplot(data=district_forecast, x='Date', y='PredictedAggregateValue', marker='o')
+plt.title("District-Level Forecast of Total Malaria Tested (Bo District)")
+plt.xlabel("Date")
+plt.ylabel("Predicted Aggregate Value")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+
+def forecast_country_level(disease, future_months=6):
+    return forecast_disease(disease, district="CountryWide", future_months=future_months)
+
+country_forecast = forecast_country_level("Total Malaria Tested", future_months=6)
+print("Country-level Forecast for Total Malaria Tested:")
+print(country_forecast)
+
+plt.figure(figsize=(12,8))
+sns.lineplot(data=country_forecast, x='Date', y='PredictedAggregateValue', marker='o')
+plt.title("Country-Level Forecast of Total Malaria Tested")
+plt.xlabel("Date")
+plt.ylabel("Predicted Aggregate Value")
 plt.xticks(rotation=45)
 plt.tight_layout()
 plt.show()
