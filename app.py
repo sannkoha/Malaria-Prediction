@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import requests
 import plotly.express as px
-import plotly.graph_objects as go
 import joblib
 from datetime import datetime
 import math
@@ -85,10 +84,8 @@ def forecast_disease(model, df_disease, feature_cols, forecast_months, override=
       - residual_std: used for optional noise injection
       - district: the district to forecast for
     """
-    # Use last available date and time_index from training data
     last_date = df_disease['Date'].max()
     last_time_index = df_disease.iloc[-1]['time_index']
-    
     forecasts = []
     for i in range(1, forecast_months + 1):
         next_date = last_date + pd.DateOffset(months=i)
@@ -97,29 +94,23 @@ def forecast_disease(model, df_disease, feature_cols, forecast_months, override=
         month = next_date.month
         month_sin = math.sin(2 * math.pi * month / 12)
         month_cos = math.cos(2 * math.pi * month / 12)
-        
-        # Build a record with all features used in training
         record = {
             'time_index': time_index,
             'DateOrdinal': date_ordinal,
             'MonthSin': month_sin,
             'MonthCos': month_cos
         }
-        # Initialize all district dummy features to 0
+        # Set all district dummy features to 0
         for col in feature_cols:
             if col.startswith("District_"):
                 record[col] = 0
-        # Set the dummy for the chosen district (if exists)
         district_dummy = "District_" + district
         if district_dummy in feature_cols:
             record[district_dummy] = 1
-        
         X_new = pd.DataFrame([record])[feature_cols]
         pred = model.predict(X_new)[0]
-        # Optional: add random noise and override adjustment
         noise = np.random.normal(scale=residual_std) if residual_std > 0 else 0
         pred = pred + noise + override
-        
         forecasts.append({
             'Disease': df_disease.iloc[0]['Disease'],
             'District': district,
@@ -140,131 +131,103 @@ st.sidebar.header("Forecast Settings")
 df_api = fetch_api_data()
 if df_api is None:
     st.stop()
-
 df_agg = preprocess_data(df_api)
 df_model = one_hot_encode(df_agg)
 
+# Allow multiple disease selection
 available_diseases = sorted(df_model['Disease'].unique())
-selected_disease = st.sidebar.selectbox("Select Disease", available_diseases)
+selected_diseases = st.sidebar.multiselect("Select Disease(s)", available_diseases, default=available_diseases[:1])
 
-# For district selection, filter the one-hot encoded data by disease
-disease_df = df_model[df_model['Disease'] == selected_disease]
-# Get unique district names from the original df_agg
-available_districts = sorted(df_agg[df_agg['Disease'] == selected_disease]['District'].unique())
-selected_districts = st.sidebar.multiselect("Select District(s)", available_districts, default=available_districts[:1])
+# Global district selection (applied per disease)
+# Note: District options may differ per disease; here we assume a common selection.
+all_districts = sorted(df_agg['District'].unique())
+selected_districts = st.sidebar.multiselect("Select District(s)", all_districts, default=all_districts[:1])
 
 forecast_months = st.sidebar.slider("Forecast Horizon (Months)", 1, 12, 6)
 override_patients = st.sidebar.number_input("Override Patients (adjust forecast)", value=0)
-
-# Option for country-level forecast (ignores district selection)
 country_forecast_option = st.sidebar.checkbox("Generate Country-Level Forecast", value=False)
 
 # Run Forecast Button
 if st.sidebar.button("Run Forecast"):
     st.sidebar.info("Running forecast, please wait...")
-    
-    # Load saved model for the selected disease
-    model = load_model(selected_disease)
-    if model is None:
-        st.error("Model loading failed. Please check the model file.")
-        st.stop()
-    
-    # Retrieve feature columns exactly as in training.
+    all_forecasts = pd.DataFrame()
+    # Retrieve feature columns exactly as in training
     dummy_cols = [col for col in df_model.columns if col.startswith("District_")]
     feature_cols = ['time_index', 'DateOrdinal', 'MonthSin', 'MonthCos'] + dummy_cols
-    
-    # Get training data for the selected disease from the one-hot encoded dataframe
-    df_disease = df_model[df_model['Disease'] == selected_disease].copy()
-    df_disease.sort_values(by='Date', inplace=True)
-    
-    # For this demo, set a default residual_std (in production, load stored metadata)
-    residual_std = 0.0
-    
-    # Generate forecast for selected districts if not country-level;
-    # otherwise, forecasts_all is empty (we'll later generate and display country-level separately)
-    forecasts_all = pd.DataFrame()
-    if not country_forecast_option:
-        for dist in selected_districts:
-            df_forecast = forecast_disease(model, df_disease, feature_cols, forecast_months,
-                                           override=override_patients, residual_std=residual_std,
-                                           district=dist)
-            forecasts_all = pd.concat([forecasts_all, df_forecast], axis=0)
-    
-    if not forecasts_all.empty:
-        st.success("District-level forecast generated!")
-        st.subheader("Future Predictions (District-level)")
-        st.dataframe(forecasts_all)
-        
-        # Visualization Section using Plotly
-        import plotly.express as px
-        
-        if len(selected_districts) == 1:
-            # Historical Trend for the selected district (from original aggregated data)
-            hist_df = df_agg[(df_agg['Disease'] == selected_disease) & (df_agg['District'] == selected_districts[0])]
-            st.subheader(f"Historical Trend in {selected_districts[0]}")
-            fig_hist = px.line(hist_df, x="Date", y="DHIS2AggregateValue",
-                               title=f"Historical {selected_disease} Cases in {selected_districts[0]}",
-                               markers=True)
-            st.plotly_chart(fig_hist, use_container_width=True)
-            
-            # Forecast Trend for the selected district
-            st.subheader(f"Forecast Trend in {selected_districts[0]}")
-            fig_forecast = px.line(forecasts_all[forecasts_all['District'] == selected_districts[0]],
-                                   x="Date", y="Predicted",
-                                   title=f"Forecasted {selected_disease} Cases in {selected_districts[0]}",
-                                   markers=True)
-            st.plotly_chart(fig_forecast, use_container_width=True)
-            
-            # Combined Historical & Forecast Trend
-            st.subheader("Combined Historical & Forecast Trend")
-            hist_df_renamed = hist_df.rename(columns={"DHIS2AggregateValue": "Cases"})
-            forecast_df_renamed = forecasts_all[forecasts_all['District'] == selected_districts[0]].rename(columns={"Predicted": "Cases"})
-            combined_df = pd.concat([hist_df_renamed[['Date','Cases']], forecast_df_renamed[['Date','Cases']]])
-            fig_combined = px.line(combined_df, x="Date", y="Cases",
-                                   title=f"Combined Trend in {selected_districts[0]}",
-                                   markers=True)
-            st.plotly_chart(fig_combined, use_container_width=True)
-            
-            # Monthly Cases Bar Chart
-            st.subheader("Monthly Cases Bar Chart")
-            hist_df['MonthYear'] = hist_df['Date'].dt.strftime('%b %Y')
-            fig_bar = px.bar(hist_df, x="MonthYear", y="DHIS2AggregateValue",
-                             title=f"Monthly Cases in {selected_districts[0]}")
-            st.plotly_chart(fig_bar, use_container_width=True)
-        else:
-            st.info("Multiple districts selected. Showing combined forecast plot.")
-        
-        # Combined Forecast Plot for all selected districts
-        st.subheader("Forecast Trend by District")
-        fig_combined_all = px.line(forecasts_all, x="Date", y="Predicted", color="District",
-                                   title="Forecast of Future Predictions by District",
-                                   markers=True)
-        st.plotly_chart(fig_combined_all, use_container_width=True)
-        
-        # Heatmap: Cases by District & Month (All Districts)
-        st.subheader("Heatmap: Cases by District & Month")
-        heat_df = df_agg[df_agg['Disease'] == selected_disease].copy()
-        heat_df['MonthYear'] = heat_df['Date'].dt.strftime('%b %Y')
-        heat_data = heat_df.pivot_table(index='District', columns='MonthYear', values='DHIS2AggregateValue', aggfunc='sum', fill_value=0)
-        fig_heat = px.imshow(heat_data, text_auto=True,
-                             title=f"Heatmap of {selected_disease} Cases Across Districts and Months",
-                             labels=dict(x="Month-Year", y="District", color="Cases"))
-        st.plotly_chart(fig_heat, use_container_width=True)
-    
-    # Separate country-level forecast visualization at the end
-    if country_forecast_option:
-        st.success("Country-level forecast generated!")
-        # Generate country-level forecast using district dummy "CountryWide"
-        country_forecast = forecast_disease(model, df_disease, feature_cols, forecast_months,
-                                            override=override_patients, residual_std=residual_std,
-                                            district="CountryWide")
-        st.subheader("Future Predictions (Country-level)")
-        st.dataframe(country_forecast)
-        
-        st.subheader("Country-Level Forecast Trend")
-        fig_country = px.line(country_forecast, x="Date", y="Predicted",
-                              title=f"Country-Level Forecast of {selected_disease} Cases",
-                              markers=True)
-        st.plotly_chart(fig_country, use_container_width=True)
+
+    # Loop over each selected disease
+    for disease in selected_diseases:
+        st.subheader(f"Forecast for {disease}")
+        model = load_model(disease)
+        if model is None:
+            st.error(f"Model loading failed for {disease}. Skipping...")
+            continue
+        # Get training data for this disease
+        df_disease = df_model[df_model['Disease'] == disease].copy()
+        df_disease.sort_values(by='Date', inplace=True)
+        # Set default residual_std (adjust or load stored metadata as needed)
+        residual_std = 0.0
+
+        # District-level Forecasts (if not country-level)
+        if not country_forecast_option:
+            disease_forecasts = pd.DataFrame()
+            # For each selected district, filter by disease-specific available districts
+            available_districts_disease = sorted(df_agg[df_agg['Disease'] == disease]['District'].unique())
+            selected_districts_disease = [d for d in selected_districts if d in available_districts_disease]
+            if not selected_districts_disease:
+                st.info(f"No matching district found for {disease}. Skipping district-level forecast.")
+            else:
+                for dist in selected_districts_disease:
+                    df_forecast = forecast_disease(model, df_disease, feature_cols, forecast_months,
+                                                   override=override_patients, residual_std=residual_std,
+                                                   district=dist)
+                    disease_forecasts = pd.concat([disease_forecasts, df_forecast], axis=0)
+                if not disease_forecasts.empty:
+                    st.success(f"District-level forecast generated for {disease}!")
+                    st.dataframe(disease_forecasts)
+                    # Display visualizations for each disease
+                    import plotly.express as px
+                    if len(selected_districts_disease) == 1:
+                        # Historical Trend for this disease & district
+                        hist_df = df_agg[(df_agg['Disease'] == disease) & 
+                                         (df_agg['District'] == selected_districts_disease[0])]
+                        st.subheader(f"Historical Trend in {selected_districts_disease[0]} for {disease}")
+                        fig_hist = px.line(hist_df, x="Date", y="DHIS2AggregateValue",
+                                           title=f"Historical {disease} Cases in {selected_districts_disease[0]}",
+                                           markers=True)
+                        st.plotly_chart(fig_hist, use_container_width=True)
+                        st.subheader(f"Forecast Trend in {selected_districts_disease[0]} for {disease}")
+                        fig_forecast = px.line(disease_forecasts[disease_forecasts['District'] == selected_districts_disease[0]],
+                                               x="Date", y="Predicted",
+                                               title=f"Forecasted {disease} Cases in {selected_districts_disease[0]}",
+                                               markers=True)
+                        st.plotly_chart(fig_forecast, use_container_width=True)
+                    else:
+                        st.info(f"Multiple districts selected for {disease}. Showing combined forecast plot.")
+                    st.subheader(f"Combined Forecast Trend by District for {disease}")
+                    fig_combined = px.line(disease_forecasts, x="Date", y="Predicted", color="District",
+                                           title=f"Forecast of Future Predictions for {disease}",
+                                           markers=True)
+                    st.plotly_chart(fig_combined, use_container_width=True)
+                    st.subheader(f"Heatmap: {disease} Cases by District & Month")
+                    heat_df = df_agg[df_agg['Disease'] == disease].copy()
+                    heat_df['MonthYear'] = heat_df['Date'].dt.strftime('%b %Y')
+                    heat_data = heat_df.pivot_table(index='District', columns='MonthYear', 
+                                                    values='DHIS2AggregateValue', aggfunc='sum', fill_value=0)
+                    fig_heat = px.imshow(heat_data, text_auto=True,
+                                         title=f"Heatmap of {disease} Cases Across Districts and Months",
+                                         labels=dict(x="Month-Year", y="District", color="Cases"))
+                    st.plotly_chart(fig_heat, use_container_width=True)
+        # Country-level Forecast Section (displayed separately below)
+        if country_forecast_option:
+            st.subheader(f"Country-Level Forecast for {disease}")
+            country_forecast = forecast_disease(model, df_disease, feature_cols, forecast_months,
+                                                override=override_patients, residual_std=residual_std,
+                                                district="CountryWide")
+            st.dataframe(country_forecast)
+            fig_country = px.line(country_forecast, x="Date", y="Predicted",
+                                  title=f"Country-Level Forecast of {disease} Cases",
+                                  markers=True)
+            st.plotly_chart(fig_country, use_container_width=True)
 else:
     st.info("Adjust settings from the sidebar and click 'Run Forecast' to generate predictions.")
